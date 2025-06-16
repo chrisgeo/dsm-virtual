@@ -1,0 +1,282 @@
+#!/bin/sh
+# Part of raspi-config https://github.com/RPi-Distro/raspi-config
+#
+# See LICENSE file for copyright and license details
+
+
+INTERACTIVE=True
+ASK_TO_REBOOT=0
+
+get_overlay_now() {
+  grep -q "boot=overlay" /proc/cmdline
+}
+
+get_overlay_conf() {
+  grep -q "boot=overlay" /boot/grub/grub.cfg
+}
+
+get_bootro_now() {
+ findmnt /boot | grep -q " ro,"
+}
+
+get_bootro_conf() {
+  grep /boot /etc/fstab | grep -q "defaults.*,ro"
+}
+
+enable_overlayfs() {
+  KERN=$(uname -r)
+  INITRD=initrd.img-"$KERN"-overlay
+
+  # mount the boot partition as writable if it isn't already
+  if get_bootro_now ; then
+    if ! mount -o remount,rw /boot 2>/dev/null ; then
+      echo "Unable to mount boot partition as writable - cannot enable"
+      return 1
+    fi
+    BOOTRO=yes
+  else
+    BOOTRO=no
+  fi
+
+  cat > /etc/initramfs-tools/scripts/overlay << 'EOF'
+# Local filesystem mounting			-*- shell-script -*-
+
+#
+# This script overrides local_mount_root() in /scripts/local
+# and mounts root as a read-only filesystem with a temporary (rw)
+# overlay filesystem.
+#
+
+. /scripts/local
+
+local_mount_root()
+{
+	local_top
+	local_device_setup "${ROOT}" "root file system"
+	ROOT="${DEV}"
+
+	# Get the root filesystem type if not set
+	if [ -z "${ROOTFSTYPE}" ]; then
+		FSTYPE=$(get_fstype "${ROOT}")
+	else
+		FSTYPE=${ROOTFSTYPE}
+	fi
+
+	local_premount
+
+	# CHANGES TO THE ORIGINAL FUNCTION BEGIN HERE
+	# N.B. this code still lacks error checking
+
+	modprobe ${FSTYPE}
+	checkfs ${ROOT} root "${FSTYPE}"
+
+	# Create directories for root and the overlay
+	mkdir /lower /upper
+
+	# Mount read-only root to /lower
+	if [ "${FSTYPE}" != "unknown" ]; then
+		mount -r -t ${FSTYPE} ${ROOTFLAGS} ${ROOT} /lower
+	else
+		mount -r ${ROOTFLAGS} ${ROOT} /lower
+	fi
+
+	modprobe overlay || insmod "/lower/lib/modules/$(uname -r)/kernel/fs/overlayfs/overlay.ko"
+
+	# Mount a tmpfs for the overlay in /upper
+	mount -t tmpfs tmpfs /upper
+	mkdir /upper/data /upper/work
+
+	# Mount the final overlay-root in $rootmnt
+	mount -t overlay \
+	    -olowerdir=/lower,upperdir=/upper/data,workdir=/upper/work \
+	    overlay ${rootmnt}
+}
+EOF
+
+  # add the overlay to the list of modules
+  if ! grep overlay /etc/initramfs-tools/modules > /dev/null; then
+    echo overlay >> /etc/initramfs-tools/modules
+  fi
+
+  # build the new initramfs
+  update-initramfs -c -k "$KERN"
+
+  # rename it so we know it has overlay added
+  mv /boot/initrd.img-"$KERN" /boot/"$INITRD"
+
+  # there is now a modified initramfs ready for use...
+
+  # modify initrd in /boot/grub/grub.conf
+  sed -i /boot/grub/grub.cfg -e 's/initrd\.img-'"$KERN"'/'"$INITRD"'/'
+
+  # modify command line
+  if ! grep -q "boot=overlay" /boot/grub/grub.cfg ; then
+      sed -i '/vmlinuz-'"$KERN"'/ s/$/ boot=overlay/' /boot/grub/grub.cfg
+  fi
+
+  if [ "$BOOTRO" = "yes" ] ; then
+    if ! mount -o remount,ro /boot 2>/dev/null ; then
+        echo "Unable to remount boot partition as read-only"
+    fi
+  fi
+}
+
+is_uname_current() {
+  test -d "/lib/modules/$(uname -r)"
+  return $?
+}
+
+disable_overlayfs() {
+  KERN=$(uname -r)
+  INITRD=initrd.img-"$KERN"-overlay
+  # mount the boot partition as writable if it isn't already
+  if get_bootro_now ; then
+    if ! mount -o remount,rw /boot 2>/dev/null ; then
+      echo "Unable to mount boot partition as writable - cannot disable"
+      return 1
+    fi
+    BOOTRO=yes
+  else
+    BOOTRO=no
+  fi
+
+  # remove the overlay to the list of modules
+  if grep -q "overlay" /etc/initramfs-tools/modules ; then
+    sed -i /etc/initramfs-tools/modules -e '/overlay/d'
+  fi
+  if update-initramfs -c -k "${KERN}" ; then
+    update-initramfs -d -k "${KERN}-overlay"
+  fi
+
+  # modify the initrd in /boot/grub/grub.cfg
+  sed -i /boot/grub/grub.cfg -e 's/'"$INITRD"'/initrd\.img-'"$KERN"'/'
+
+  # modify command line
+  sed -i '/vmlinuz-'"$KERN"'/ s/ boot=overlay//' /boot/grub/grub.cfg
+
+  if [ "$BOOTRO" = "yes" ] ; then
+    if ! mount -o remount,ro /boot 2>/dev/null ; then
+        echo "Unable to remount boot partition as read-only"
+    fi
+  fi
+}
+
+enable_bootro() {
+  if get_overlay_now ; then
+    echo "Overlay in use; cannot update fstab"
+    return 1
+  fi
+  sed -i /etc/fstab -e "s/\(.*\/boot.*\)defaults\(.*\)/\1defaults,ro\2/"
+}
+
+disable_bootro() {
+  if get_overlay_now ; then
+    echo "Overlay in use; cannot update fstab"
+    return 1
+  fi
+  sed -i /etc/fstab -e "s/\(.*\/boot.*\)defaults,ro\(.*\)/\1defaults\2/"
+}
+
+do_finish() {
+  if [ $ASK_TO_REBOOT -eq 1 ]; then
+    whiptail --yesno "Would you like to reboot now?" 20 60 2
+    if [ $? -eq 0 ]; then # yes
+      sync
+      reboot
+    fi
+  fi
+  exit 0
+}
+
+do_overlayfs() {
+  DEFAULT=--defaultno
+  CURRENT=0
+  STATUS="disabled"
+
+  if [ "$INTERACTIVE" = True ] && ! is_uname_current; then
+    whiptail --msgbox "Could not find modules for the running kernel ($(uname -r))." 20 60 1
+    return 1
+  fi
+
+  if get_overlay_conf; then
+    DEFAULT=
+    CURRENT=1
+    STATUS="enabled"
+  fi
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --yesno "Would you like the overlay file system to be enabled?" $DEFAULT 20 60 2
+    RET=$?
+  else
+    RET=$1
+  fi
+  if [ $RET -eq $CURRENT ]; then
+    if [ $RET -eq 0 ]; then
+      if enable_overlayfs; then
+        STATUS="enabled"
+        ASK_TO_REBOOT=1
+      else
+        STATUS="unchanged"
+      fi
+    elif [ $RET -eq 1 ]; then
+      if disable_overlayfs; then
+        STATUS="disabled"
+        ASK_TO_REBOOT=1
+      else
+        STATUS="unchanged"
+      fi
+    else
+      return $RET
+    fi
+  fi
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --msgbox "The overlay file system is $STATUS." 20 60 1
+  fi
+  if get_overlay_now ; then
+    if get_bootro_conf; then
+      BPRO="read-only"
+    else
+      BPRO="writable"
+    fi
+    whiptail --msgbox "The boot partition is currently $BPRO. This cannot be changed while an overlay file system is enabled." 20 60 1
+  else
+    DEFAULT=--defaultno
+    CURRENT=0
+    STATUS="writable"
+    if get_bootro_conf; then
+      DEFAULT=
+      CURRENT=1
+      STATUS="read-only"
+    fi
+    if [ "$INTERACTIVE" = True ]; then
+      whiptail --yesno "Would you like the boot partition to be write-protected?" $DEFAULT 20 60 2
+      RET=$?
+    else
+      RET=$1
+    fi
+    if [ $RET -eq $CURRENT ]; then
+      if [ $RET -eq 0 ]; then
+        if enable_bootro; then
+          STATUS="read-only"
+          ASK_TO_REBOOT=1
+        else
+          STATUS="unchanged"
+        fi
+      elif [ $RET -eq 1 ]; then
+        if disable_bootro; then
+          STATUS="writable"
+          ASK_TO_REBOOT=1
+        else
+          STATUS="unchanged"
+        fi
+      else
+        return $RET
+      fi
+    fi
+    if [ "$INTERACTIVE" = True ]; then
+      whiptail --msgbox "The boot partition is $STATUS." 20 60 1
+    fi
+  fi
+  do_finish
+}
+
+do_overlayfs

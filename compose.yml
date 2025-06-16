@@ -1,0 +1,24 @@
+services:
+  dsm:
+    container_name: dsm
+    image: vdsm/virtual-dsm
+    environment:
+      DISK_SIZE: "50G"
+    devices:
+      - /dev/kvm
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - 6500:5000
+    volumes:
+      - /volume1/@database/dsm:/storage
+      - /volume5/@tmp.user/:/tmp
+      - .:/app/
+      - /etc/:/etc.d/
+      - /usr/bin:/usr/bin.d
+      - /lib/:/lib.d/
+      - /usr:/usr.d
+      - /var:/var.d
+
+    #restart: on-failure
+    stop_grace_period: 2m
